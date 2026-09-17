@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+# gh pr create fires "opened" before "labeled"; cancel the stale run.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  labels:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    outputs:
+      label: ${{ steps.read.outputs.label }}
+    steps:
+      # Read labels live instead of from the event payload so both runs agree.
+      - id: read
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          names="$(gh pr view "${{ github.event.pull_request.number }}" --repo "${{ github.repository }}" --json labels --jq '.labels[].name')"
+          label=""
+          if grep -qx implement <<< "$names"; then
+            label=implement
+          elif grep -qx bdd-draft <<< "$names"; then
+            label=bdd-draft
+          fi
+          echo "label=$label" >> "$GITHUB_OUTPUT"
+          echo "labels: $(tr '\n' ' ' <<< "$names")-> ${label:-none}"
+
+  scope:
+    needs: labels
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check PR scope
+        env:
+          PR_LABEL: ${{ needs.labels.outputs.label }}
+        run: bash .github/scripts/check-pr-scope.sh
+
+  contract:
+    needs: labels
+    # Runs on push (labels skipped) and on every PR except bdd-draft.
+    if: ${{ !cancelled() && needs.labels.outputs.label != 'bdd-draft' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npx playwright install --with-deps chromium
+      - run: npm run build
+      - run: npm run test:contract
